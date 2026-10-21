@@ -503,12 +503,24 @@ def verify_facts(company, financial, prices, news, ticker=None):
     else:
         bad = (pd.to_numeric(prices['고가'], errors='coerce') < pd.to_numeric(prices['저가'], errors='coerce')).sum()
         record('주가 고가≥저가', '확인' if bad == 0 else '불일치', f'위반 행: {bad}건')
+        # 거래일별 비정상 입력값은 앱 차트와 별도로 드러내고 값을 임의 보정하지 않습니다.
+        from stock_chart import ohlc_valid_mask
+        known_ohlc = prices[['시가', '고가', '저가', '종가']].notna().all(axis=1)
+        invalid_ohlc = int((known_ohlc & ~ohlc_valid_mask(prices)).sum())
+        complete = int(known_ohlc.sum())
+        missing = len(prices) - complete
+        state = ('확인 필요' if complete == 0 else '불일치' if invalid_ohlc else '확인')
+        record('시가·고가·저가·종가 관계', state,
+               f'완전한 OHLC: {complete}건 / OHLC 일부 누락: {missing}건 / 비정상 OHLC: {invalid_ohlc}건')
+        invalid_volume = int((pd.to_numeric(prices['거래량'], errors='coerce') < 0).sum())
+        record('거래량 음수 여부', '확인' if invalid_volume == 0 else '불일치',
+               f'음수 거래량: {invalid_volume}건')
     record('기사 내용 사실 여부', '확인 필요',
            f'기사 검색 결과 {len(news)}건. 제목/요약만 수집했으며, 원문 검증과 기사 진위 판단은 별도 필요')
     return pd.DataFrame(checks)
 
 
-def collect_all(company, finance_key=None, stock_key=None, year_count=3, news_key=None, selected_crno=None, serpapi_key=None):
+def collect_all(company, finance_key=None, stock_key=None, year_count=3, news_key=None, selected_crno=None, serpapi_key=None, stock_days=730):
     """기업명 → 금융위 재무·시세 + 뉴스 → pandas 통계/검증.
 
     API 키는 명시적으로 분리하지만 두 서비스에 동일 공공데이터키를 사용해도 됩니다.
@@ -532,7 +544,7 @@ def collect_all(company, finance_key=None, stock_key=None, year_count=3, news_ke
     else:
         errors.append('재무정보 API: FINANCE_API_KEY 또는 DATA_GO_KR_API_KEY 미설정')
     try:
-        prices, ticker, warnings = fetch_stock(company, stock_key)
+        prices, ticker, warnings = fetch_stock(company, stock_key, days=stock_days)
         errors.extend(warnings)
     except (RuntimeError, ValueError) as exc:
         errors.append('주식시세정보 API: ' + str(exc)[:160])
