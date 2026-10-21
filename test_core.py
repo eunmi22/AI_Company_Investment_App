@@ -21,7 +21,7 @@ class CoreTest(unittest.TestCase):
         }])
         self.prices = pd.DataFrame([{'날짜': pd.Timestamp('2024-12-01'), '시가': 10,
                                      '고가': 12, '저가': 9, '종가': 11, '거래량': 100, '출처': '테스트'}])
-        self.news = pd.DataFrame([{'발행일': '2024-12-01', '제목': '테스트 기사', '언론사': '테스트뉴스',
+        self.news = pd.DataFrame([{'발행일': '2024-12-01', '제목': '테스트기업 실적 기사', '언론사': '테스트뉴스',
                                    '요약': '', '링크': 'https://example.com/1', '출처': '테스트 RSS'}])
         self.result = {'기업명': '테스트기업', '종목코드': '000000', '수집시각': '2026-01-01 00:00:00',
                        '재무': self.financial, '주가': self.prices, '뉴스': self.news,

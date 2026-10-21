@@ -4,6 +4,7 @@
 기존 core.py 기반 금융위원회 재무/주식시세 + 뉴스 + AI 보고서를 유지합니다.
 """
 import math
+import hmac
 import os
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from core import collect_all, ai_review, excel_bytes, report_markdown
+from news_analysis import analyze_news_articles, sentiment_summary, verify_news_analysis
 from stock_chart import (
     PERIODS, MA_WINDOWS, make_stock_figure, ohlc_valid_mask,
     prepare_stock_history, select_stock_period, summarize_stock_period,
@@ -65,7 +67,7 @@ def units(value, unit='주'):
 
 
 st.title('📈 AI 기업 재무·주가·뉴스 통합분석')
-st.caption('공식 공공데이터 기반 · 주가 차트 고도화 · pandas 검증 · AI 투자검토 보고서')
+st.caption('공식 공공데이터 · 전문 주가 차트 · 뉴스 건별 긍정/부정 AI 분석 · 사실검증')
 
 common_key = get_secret('DATA_GO_KR_API_KEY', 'DATA_GO_KR_KEY')
 finance_key = get_secret('FINANCE_API_KEY') or common_key
@@ -74,6 +76,7 @@ openai_key = get_secret('OPENAI_API_KEY')
 news_key = get_secret('NEWS_API_KEY')
 serpapi_key = get_secret('SERPAPI_KEY')
 model = get_secret('OPENAI_MODEL') or 'gpt-4.1-mini'
+ai_access_code = get_secret('AI_ACCESS_CODE')
 
 with st.sidebar:
     st.header('분석 조건')
@@ -89,6 +92,16 @@ with st.sidebar:
         st.write(f'{label}:', '설정됨' if key else '미설정')
     if not finance_key or not stock_key:
         st.warning('공공데이터 키가 없습니다. DATA_GO_KR_API_KEY 또는 개별 키를 설정하세요.')
+    if ai_access_code:
+        user_code = st.text_input('AI 뉴스분석·보고서 접근 코드', type='password',
+                                  help='공개 URL을 공유할 때 OpenAI API 남용을 줄이기 위한 간단한 접근 보호')
+        ai_allowed = bool(openai_key) and hmac.compare_digest(user_code, ai_access_code)
+        if not ai_allowed:
+            st.caption('접근 코드를 입력해야 유료 AI 호출 버튼을 사용할 수 있습니다.')
+    else:
+        ai_allowed = bool(openai_key)
+        if openai_key:
+            st.caption('공개 배포 시 AI_ACCESS_CODE를 Secrets에 설정해 유료 AI 기능을 보호하세요.')
     st.caption('뉴스 조회: NewsAPI → SerpAPI → Google 뉴스 RSS')
     analyze = st.button('1단계 · 데이터 수집 및 pandas 분석', type='primary',
                         use_container_width=True)
@@ -227,12 +240,101 @@ with stock_tab:
             st.dataframe(view, hide_index=True, use_container_width=True)
 
 with news_tab:
-    st.caption('뉴스는 검색 제목·요약이며 기사 본문이나 보도 내용의 진위를 자동 확인한 것이 아닙니다.')
+    st.subheader('기업 관련 뉴스 · 기사별 AI 감성 분석')
+    st.caption('감성은 기업 실적·사업에 미칠 수 있는 **추정 영향 방향**입니다. '
+               '기사 제목과 검색 요약만 분석하며 본문·사실 여부·주가 방향은 검증하거나 예측하지 않습니다.')
+
+    # 수집된 뉴스는 core.collect_all에서 먼저 기업 관련성을 검사하고 중복을 제거합니다.
+    progress = result.get('뉴스처리현황', pd.DataFrame())
+    if not progress.empty:
+        pcols = st.columns(3)
+        for col, _, row in zip(pcols, range(3), progress.itertuples(index=False)):
+            col.metric(row[0], f'{row[1]:,}건')
+
     if news.empty:
-        st.info('검색된 뉴스가 없습니다.')
+        st.info('기업 관련성이 확인되는 뉴스 후보가 없습니다. 필터에서 제외된 기사는 아래에서 확인하세요.')
     else:
-        st.dataframe(news, use_container_width=True, hide_index=True,
-                     column_config={'링크': st.column_config.LinkColumn('기사 바로가기')})
+        analyzed = result.get('뉴스분석', pd.DataFrame())
+        has_ai_news = isinstance(analyzed, pd.DataFrame) and not analyzed.empty
+
+        if not openai_key:
+            st.warning('기사별 긍정/부정 AI 분류에는 OPENAI_API_KEY가 필요합니다. 현재 뉴스 목록은 AI 미분석 상태입니다.')
+        elif ai_access_code and not ai_allowed:
+            st.info('AI 기사별 분석을 실행하려면 왼쪽 사이드바의 접근 코드를 입력하세요.')
+        if st.button('🧠 기사별 AI 긍정·부정·중립 분석 실행',
+                     key='news_sentiment_button', disabled=not ai_allowed,
+                     use_container_width=True):
+            try:
+                with st.spinner(f'기사 {len(news)}건의 기업 영향 방향과 위험요인을 분석하는 중...'):
+                    result['뉴스분석'] = analyze_news_articles(
+                        news, company=result['기업명'], openai_key=openai_key, model=model)
+                    result['뉴스감성검증'] = verify_news_analysis(news, result['뉴스분석'])
+                    # 이전 보고서는 뉴스 분석 결과가 달라질 수 있으므로 폐기
+                    st.session_state.pop('ai_report', None)
+                st.success('기사별 AI 분류를 완료했습니다. 아래 표·집계를 확인하세요.')
+            except Exception as exc:
+                st.error(f'뉴스 AI 분류 실패 ({type(exc).__name__}). 모델·인증키·응답 형식을 확인하세요.')
+
+        analyzed = result.get('뉴스분석', pd.DataFrame())
+        has_ai_news = isinstance(analyzed, pd.DataFrame) and not analyzed.empty
+        if has_ai_news:
+            counted = sentiment_summary(analyzed)
+            st.markdown('**기사별 기업 영향 방향 분포**')
+            bar_columns = st.columns(5)
+            for col, row in zip(bar_columns, counted.to_dict('records')):
+                col.metric(row['감성'], f"{row['기사수']}건", help='분석 대상 중 AI가 기업과 무관하다고 분류한 기사는 제외한 집계')
+            import plotly.express as px
+            chart = px.bar(
+                counted, x='감성', y='기사수', color='감성', text='기사수',
+                category_orders={'감성': ['긍정', '부정', '중립', '혼합', '판단보류']},
+                color_discrete_map={'긍정':'#d95a58', '부정':'#4587d4',
+                                    '중립':'#8b939d', '혼합':'#d6a348', '판단보류':'#b2b8bd'})
+            chart.update_layout(height=270, showlegend=False, margin=dict(l=0,r=10,t=10,b=0),
+                                xaxis_title=None, yaxis_title='기사 수')
+            chart.update_traces(textposition='outside', cliponaxis=False)
+            st.plotly_chart(chart, use_container_width=True,
+                            config={'displaylogo': False})
+
+            sentiment_filter = st.selectbox('감성별 기사 필터',
+                ['전체', '긍정', '부정', '중립', '혼합', '판단보류'], key='news_sentiment_filter')
+            show_only_related = st.checkbox('AI가 관련 없다고 판단한 기사 제외', value=True,
+                                            key='news_only_related')
+            view = analyzed.copy()
+            if show_only_related:
+                view = view[view['AI관련성'] != '무관']
+            if sentiment_filter != '전체':
+                view = view[view['감성'] == sentiment_filter]
+            colored = {'긍정': '🔴 긍정', '부정': '🔵 부정', '중립': '⚪ 중립',
+                       '혼합': '🟠 혼합', '판단보류': '⚫ 판단보류'}
+            view['영향판정'] = view['감성'].map(colored)
+            st.dataframe(view[['발행시각(KST)', '영향판정', '제목', '언론사', 'AI관련성', '영향분야',
+                               '위험요인', '판단근거', '링크']],
+                         use_container_width=True, hide_index=True,
+                         column_config={'링크': st.column_config.LinkColumn('원문 열기'),
+                                        '제목': st.column_config.TextColumn('기사 제목', width='large'),
+                                        '판단근거': st.column_config.TextColumn('AI 판단 근거', width='large')})
+            risks = analyzed[(analyzed['AI관련성'] != '무관') &
+                             (analyzed['감성'].isin(['부정', '혼합']))]
+            if not risks.empty:
+                with st.expander(f'부정·혼합 뉴스에서 점검할 위험 요인: {len(risks)}건'):
+                    st.dataframe(risks[['제목', '위험요인', '판단근거', '링크']],
+                                 hide_index=True, use_container_width=True,
+                                 column_config={'링크': st.column_config.LinkColumn('기사 링크')})
+            st.caption('상승·하락 색상은 한국 증권 화면 관례를 따릅니다. 이 집계는 뉴스 건수 분포일 뿐 투자 신호나 확률이 아닙니다.')
+        else:
+            st.info('현재는 **AI 분류 전**입니다. 위 버튼을 누르면 기사별 감성과 판단근거가 생성됩니다.')
+            st.dataframe(news[['발행시각(KST)', '제목', '언론사', '요약', '사전관련성', '링크']],
+                         use_container_width=True, hide_index=True,
+                         column_config={'링크': st.column_config.LinkColumn('기사 원문'),
+                                        '요약': st.column_config.TextColumn('검색 요약', width='large')})
+
+    excluded = result.get('뉴스제외', pd.DataFrame())
+    if isinstance(excluded, pd.DataFrame) and not excluded.empty:
+        with st.expander(f'분석에서 제외한 뉴스 보기: {len(excluded)}건'):
+            st.caption('기업 관련성이 부족한 기사, 유사 제목 중복, 잘못된 링크 등을 기록합니다.')
+            st.dataframe(excluded[['제목', '언론사', '제외사유', '링크']],
+                         hide_index=True, use_container_width=True,
+                         column_config={'링크': st.column_config.LinkColumn('확인 링크')})
 
 with quality_tab:
     st.subheader('결측값 및 중복 점검')
@@ -243,7 +345,10 @@ with quality_tab:
     st.dataframe(result['사실검증'], use_container_width=True, hide_index=True)
     st.subheader('출처 · 기준일')
     st.dataframe(result['출처'], use_container_width=True, hide_index=True)
-    st.caption('위 검증은 숫자의 내부 일관성을 확인하며 AI 의견이나 기사 진위를 보증하지 않습니다.')
+    if isinstance(result.get('뉴스감성검증'), pd.DataFrame):
+        st.subheader('뉴스 감성분석 구조적 검증')
+        st.dataframe(result['뉴스감성검증'], hide_index=True, use_container_width=True)
+    st.caption('위 검증은 수치/기사 ID·링크의 내부 일관성을 확인하며 AI 의견이나 기사 진위를 보증하지 않습니다.')
 
 st.download_button('pandas 통합 분석 Excel 다운로드 (.xlsx)', data=excel_bytes(result),
                    file_name=f"{result['기업명']}_통합분석.xlsx",
@@ -251,14 +356,20 @@ st.download_button('pandas 통합 분석 Excel 다운로드 (.xlsx)', data=excel
                    use_container_width=True)
 st.divider()
 st.header('2단계 · OpenAI 투자검토 보고서')
-st.caption('수익성 · 안정성 · 주가 추세 · 뉴스 위험 요인 · 사실 검증. 숫자 계산은 pandas가 수행합니다.')
+st.caption('기사별 감성 추정 결과를 뉴스 위험 검토에 함께 활용합니다. 재무·주가 숫자는 pandas 검증표를 기준으로 합니다.')
 if not openai_key:
     st.warning('OPENAI_API_KEY 미설정: AI 보고서 생성은 실행할 수 없습니다.')
 if st.button('2단계 · AI 투자검토 보고서 생성', type='primary',
-             disabled=not bool(openai_key)):
+             disabled=not ai_allowed):
     try:
-        with st.spinner('OpenAI가 입력 데이터로 정성 보고서를 작성하고 있습니다...'):
+        with st.spinner('기사별 AI 감성분석 및 투자검토 보고서를 생성하고 있습니다...'):
+            if not news.empty and not isinstance(result.get('뉴스분석'), pd.DataFrame):
+                result['뉴스분석'] = analyze_news_articles(
+                    news, company=result['기업명'], openai_key=openai_key, model=model)
+                result['뉴스감성검증'] = verify_news_analysis(news, result['뉴스분석'])
             st.session_state['ai_report'] = ai_review(result, openai_key, model=model)
+            # 뉴스 탭은 위쪽에 있으므로 한 번 새로고침하여 새로운 분류표를 표시
+            st.rerun()
     except Exception as exc:
         st.error(f'AI 보고서 생성 실패 ({type(exc).__name__}). 모델 권한·응답 형식을 확인하세요.')
 report = st.session_state.get('ai_report')
